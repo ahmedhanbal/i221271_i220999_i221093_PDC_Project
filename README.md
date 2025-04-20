@@ -7,5 +7,5 @@
 ## Paper : Parallel Social Behaviour Based Identifiaction of Influential Users Algorithm - PSAIIM
 ## Phase 1 - 20 April 2025
  - Presentation Slides
-	- PSAIIM Overview
-        - Parallelization Strategy
+   * PSAIIM Overview
+   * Parallelization Strategy
