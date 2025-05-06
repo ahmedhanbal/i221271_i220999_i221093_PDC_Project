@@ -1,5 +1,6 @@
 #include "../include/psaiim.h"
 #include <chrono>
+#include <cstring>
 
 int main(int argc, char** argv) {
     // Initialize MPI
@@ -9,6 +10,10 @@ int main(int argc, char** argv) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    // Get hostname for debugging
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
     
     // Check command line arguments
     if (argc != 4) {
@@ -32,6 +37,14 @@ int main(int argc, char** argv) {
         std::cout << "Graph file: " << metisFile << std::endl;
         std::cout << "Partition file: " << partFile << std::endl;
         std::cout << "Number of seeds (k): " << k << std::endl;
+    }
+    
+    // Log all hosts and their ranks
+    for (int i = 0; i < size; i++) {
+        if (rank == i) {
+            std::cout << "Process rank " << rank << " running on host: " << hostname << std::endl;
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
     }
     
     // Load partitioned graph for this rank

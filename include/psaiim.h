@@ -14,6 +14,7 @@
 #include <iostream>
 #include <mpi.h>
 #include <omp.h>
+#include <unistd.h> // For gethostname
 
 // Types and Structures
 using NodeId = int;

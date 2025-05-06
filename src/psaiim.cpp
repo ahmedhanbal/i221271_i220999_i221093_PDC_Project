@@ -191,7 +191,7 @@ std::unordered_map<NodeId, double> ParallelPR(const Graph& graph,
     const double epsilon = 1e-6;
     double diff = 1.0;
     
-    // Maps for component to nodes and node to component
+    // Maps for component to nodes
     std::unordered_map<CompId, std::vector<NodeId>> compToNodes;
     
     // Build compToNodes mapping
@@ -199,20 +199,36 @@ std::unordered_map<NodeId, double> ParallelPR(const Graph& graph,
         compToNodes[compId].push_back(node);
     }
     
-    // Initialize influence power
+    // Initialize influence power - use thread-safe initialization
     std::unordered_map<NodeId, double> IP_old, IP_new;
+    const double initialValue = 1.0 / nodeCount;
+    
     for (NodeId node : graph.nodes) {
-        IP_old[node] = 1.0 / nodeCount;
+        IP_old[node] = initialValue;
+        IP_new[node] = 0.0;  // Initialize to zero to avoid data races
     }
     
     // Iterative computation until convergence
-    while (diff > epsilon) {
+    int maxIterations = 100;  // Add a maximum iterations limit
+    int iteration = 0;
+    
+    while (diff > epsilon && iteration < maxIterations) {
+        iteration++;
+        
+        // Reset IP_new to zero for this iteration - prevent race conditions
+        for (NodeId node : graph.nodes) {
+            IP_new[node] = (1.0 - dampingFactor) / nodeCount;  // Start with teleport probability
+        }
+        
         // Process each level in sequence (MPI ranks assigned to levels)
         for (const auto& level : levels) {
             // Process components in the current level in parallel
-            #pragma omp parallel for
+            #pragma omp parallel for schedule(dynamic)
             for (size_t i = 0; i < level.size(); i++) {
                 CompId compId = level[i];
+                
+                // Create thread-local temporary storage
+                std::unordered_map<NodeId, double> localUpdates;
                 
                 // Process nodes in the component
                 for (NodeId u : compToNodes[compId]) {
@@ -226,28 +242,70 @@ std::unordered_map<NodeId, double> ParallelPR(const Graph& graph,
                         }
                     }
                     
-                    // Update influence power
-                    IP_new[u] = dampingFactor * sum + (1.0 - dampingFactor) / nodeCount;
+                    // Store in thread-local map first
+                    localUpdates[u] = dampingFactor * sum;
+                }
+                
+                // Update global IP_new with thread-local results
+                #pragma omp critical
+                {
+                    for (const auto& [node, value] : localUpdates) {
+                        IP_new[node] += value;  // Add to the teleport probability already there
+                    }
                 }
             }
         }
         
-        // Calculate difference for convergence check
+        // Calculate difference for convergence check - use thread-safe reduction
         diff = 0.0;
-        for (NodeId node : graph.nodes) {
-            diff += std::abs(IP_new[node] - IP_old[node]);
-            IP_old[node] = IP_new[node];
+        
+        // Convert unordered_set to vector for proper OpenMP iteration
+        std::vector<NodeId> nodesVector(graph.nodes.begin(), graph.nodes.end());
+        
+        #pragma omp parallel reduction(+:diff)
+        {
+            double localDiff = 0.0;
+            
+            #pragma omp for nowait
+            for (size_t i = 0; i < nodesVector.size(); i++) {
+                NodeId node = nodesVector[i];
+                localDiff += std::abs(IP_new[node] - IP_old[node]);
+                
+                // Update old values (thread-safe since each thread handles different nodes)
+                #pragma omp critical
+                {
+                    IP_old[node] = IP_new[node];
+                }
+            }
+            
+            diff = localDiff;
+        }
+        
+        if (iteration % 10 == 0) {
+            char hostname[256];
+            gethostname(hostname, sizeof(hostname));
+            std::cout << "[Host: " << hostname << "] Iteration " << iteration << ", diff = " << diff << std::endl;
         }
     }
+    
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
+    std::cout << "[Host: " << hostname << "] PageRank converged after " << iteration << " iterations with diff = " << diff << std::endl;
     
     return IP_old;
 }
 
 // Get nodes at a specific distance from a source node
 std::unordered_set<NodeId> NodesAtDistance(const Graph& graph, NodeId source, int distance) {
+    // Each call gets its own data structures to ensure thread safety
     std::unordered_set<NodeId> result;
     std::unordered_map<NodeId, int> nodeDistance;
     std::queue<NodeId> q;
+    
+    // Skip BFS entirely if distance is too small
+    if (distance <= 0) {
+        return result;
+    }
     
     // Initialize BFS
     q.push(source);
@@ -262,18 +320,24 @@ std::unordered_set<NodeId> NodesAtDistance(const Graph& graph, NodeId source, in
         
         if (currentDist == distance) {
             result.insert(current);
-            continue;
+            continue;  // Don't explore neighbors of nodes at target distance
         }
         
         if (currentDist > distance) {
-            continue;
+            continue;  // Stop if we've gone too far
         }
         
         // Explore neighbors
         for (NodeId neighbor : graph.getNeighbors(current)) {
+            // Avoid cycles: only process a node if we haven't seen it yet
             if (nodeDistance.find(neighbor) == nodeDistance.end()) {
                 nodeDistance[neighbor] = currentDist + 1;
                 q.push(neighbor);
+                
+                // Add to result if exactly at target distance
+                if (currentDist + 1 == distance) {
+                    result.insert(neighbor);
+                }
             }
         }
     }
@@ -287,9 +351,10 @@ std::vector<NodeId> SelectCandidates(const Graph& graph, const std::unordered_ma
     std::vector<NodeId> nodesList(graph.nodes.begin(), graph.nodes.end());
     std::vector<NodeId> candidates;
     
-    // Process nodes in parallel
+    // Process nodes in parallel - use thread-local storage
     #pragma omp parallel
     {
+        // Local candidates for each thread
         std::vector<NodeId> localCandidates;
         
         #pragma omp for
@@ -325,10 +390,14 @@ std::vector<NodeId> SelectCandidates(const Graph& graph, const std::unordered_ma
             }
         }
         
-        // Merge local candidates to global list
+        // Merge local candidates to global list with proper synchronization
         #pragma omp critical
         {
-            candidates.insert(candidates.end(), localCandidates.begin(), localCandidates.end());
+            // Allocate sufficient space first to avoid reallocation issues
+            size_t oldSize = candidates.size();
+            candidates.resize(oldSize + localCandidates.size());
+            // Copy elements instead of using insert which might reallocate
+            std::copy(localCandidates.begin(), localCandidates.end(), candidates.begin() + oldSize);
         }
     }
     
@@ -337,21 +406,42 @@ std::vector<NodeId> SelectCandidates(const Graph& graph, const std::unordered_ma
 
 // Create influence BFS tree for a candidate
 TreeInfo InfluenceBFSTree(const Graph& graph, NodeId root, const std::vector<NodeId>& candidates) {
-    std::unordered_set<NodeId> visited = {root};
-    std::unordered_map<NodeId, NodeId> parent = {{root, -1}};
-    std::unordered_map<NodeId, int> depth = {{root, 0}};
+    // Each call gets its own data structures
+    TreeInfo tree;
+    tree.root = root;
+    
+    // Use sets for faster lookup and avoid duplicates
+    std::unordered_set<NodeId> visited;
+    std::unordered_map<NodeId, NodeId> parent;
+    std::unordered_map<NodeId, int> depth;
     std::queue<NodeId> q;
+    
+    // Initialize with root
+    visited.insert(root);
+    parent[root] = -1;
+    depth[root] = 0;
     q.push(root);
     
-    // Convert candidates to set for faster lookup
+    // Convert candidates to set for faster lookup - make a copy to ensure thread safety
     std::unordered_set<NodeId> candidateSet(candidates.begin(), candidates.end());
     
-    // BFS traversal
+    // BFS traversal with maximum depth limit to avoid infinite loops in cycles
+    const int MAX_DEPTH = 100; // Reasonable limit for social networks
+    
     while (!q.empty()) {
         NodeId v = q.front();
         q.pop();
         
-        for (NodeId w : graph.getNeighbors(v)) {
+        // Stop exploring if we've reached the maximum depth
+        if (depth[v] >= MAX_DEPTH) {
+            continue;
+        }
+        
+        // Get neighbors safely
+        const std::vector<NodeId>& neighbors = graph.getNeighbors(v);
+        
+        for (NodeId w : neighbors) {
+            // Only add nodes that are candidates and haven't been visited
             if (visited.find(w) == visited.end() && candidateSet.find(w) != candidateSet.end()) {
                 visited.insert(w);
                 parent[w] = v;
@@ -361,31 +451,36 @@ TreeInfo InfluenceBFSTree(const Graph& graph, NodeId root, const std::vector<Nod
         }
     }
     
-    // Calculate average depth
+    // Calculate average depth - guard against division by zero
     double totalDepth = 0.0;
     for (const auto& [node, nodeDepth] : depth) {
         totalDepth += nodeDepth;
     }
-    double avgDepth = visited.size() > 0 ? totalDepth / visited.size() : 0.0;
     
-    // Create and return TreeInfo
-    TreeInfo tree;
-    tree.root = root;
     tree.size = visited.size();
-    tree.avgDepth = avgDepth;
-    tree.nodes = std::move(visited);
+    tree.avgDepth = (tree.size > 0) ? totalDepth / tree.size : 0.0;
+    tree.nodes = std::move(visited); // Move to avoid copy
     
     return tree;
 }
 
 // Algorithm 7: Select Seeds
 std::vector<NodeId> SelectSeeds(const Graph& graph, const std::vector<NodeId>& candidates, int k) {
+    // Vector to store tree information (thread-safe)
     std::vector<TreeInfo> treeInfos;
+    
+    // Pre-allocate space to avoid resizing during merge
+    #pragma omp single
+    {
+        treeInfos.reserve(candidates.size());
+    }
     
     // Build influence trees for each candidate in parallel
     #pragma omp parallel
     {
+        // Local storage for each thread
         std::vector<TreeInfo> localTreeInfos;
+        localTreeInfos.reserve(candidates.size() / omp_get_num_threads() + 1);
         
         #pragma omp for
         for (size_t i = 0; i < candidates.size(); i++) {
@@ -394,10 +489,14 @@ std::vector<NodeId> SelectSeeds(const Graph& graph, const std::vector<NodeId>& c
             localTreeInfos.push_back(tree);
         }
         
-        // Merge local trees to global list
+        // Merge local trees to global list with proper synchronization
         #pragma omp critical
         {
-            treeInfos.insert(treeInfos.end(), localTreeInfos.begin(), localTreeInfos.end());
+            // Allocate sufficient space first to avoid reallocation issues
+            size_t oldSize = treeInfos.size();
+            treeInfos.resize(oldSize + localTreeInfos.size());
+            // Copy elements instead of using insert which might reallocate
+            std::copy(localTreeInfos.begin(), localTreeInfos.end(), treeInfos.begin() + oldSize);
         }
     }
     
@@ -406,6 +505,7 @@ std::vector<NodeId> SelectSeeds(const Graph& graph, const std::vector<NodeId>& c
     
     // Select seeds
     std::vector<NodeId> seeds;
+    seeds.reserve(k);  // Reserve space for efficiency
     std::unordered_set<NodeId> covered;
     
     for (const TreeInfo& tree : treeInfos) {
@@ -439,50 +539,93 @@ Graph LoadPartitionedGraph(const std::string& metisFile, const std::string& part
     
     // Read the METIS part file to determine which nodes belong to this rank
     std::unordered_set<NodeId> myNodes;
-    std::ifstream partStream(partFile);
-    if (!partStream) {
-        std::cerr << "Error: Cannot open part file " << partFile << std::endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
     
-    NodeId node = 1; // METIS nodes are 1-indexed
-    CompId part;
-    while (partStream >> part) {
-        if (part % numProcs == rank) { // Simple distribution by modulo
-            myNodes.insert(node);
+    try {
+        std::ifstream partStream(partFile);
+        if (!partStream) {
+            std::cerr << "Error: Cannot open part file " << partFile << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        node++;
-    }
-    
-    // Read the METIS graph file
-    std::ifstream graphStream(metisFile);
-    if (!graphStream) {
-        std::cerr << "Error: Cannot open METIS graph file " << metisFile << std::endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    
-    // Read header
-    std::string line;
-    std::getline(graphStream, line);
-    std::istringstream iss(line);
-    int numNodes, numEdges, fmt;
-    iss >> numNodes >> numEdges >> fmt;
-    
-    // Read adjacency lists
-    node = 1; // Reset node counter
-    while (std::getline(graphStream, line)) {
-        std::istringstream lineStream(line);
-        NodeId neighbor;
         
-        // Add edges for this node
-        while (lineStream >> neighbor) {
-            // If this node or its neighbor is in my partition, add the edge
-            if (myNodes.find(node) != myNodes.end() || myNodes.find(neighbor) != myNodes.end()) {
-                graph.addEdge(node, neighbor);
+        NodeId node = 1; // METIS nodes are 1-indexed
+        CompId part;
+        while (partStream >> part) {
+            if (part % numProcs == rank) { // Simple distribution by modulo
+                myNodes.insert(node);
+            }
+            node++;
+        }
+        
+        partStream.close();
+        
+        // Read the METIS graph file
+        std::ifstream graphStream(metisFile);
+        if (!graphStream) {
+            std::cerr << "Error: Cannot open METIS graph file " << metisFile << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        
+        // Read header
+        std::string line;
+        if (!std::getline(graphStream, line)) {
+            std::cerr << "Error: Empty METIS file" << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        
+        int numNodes = 0, numEdges = 0, fmt = 0;
+        try {
+            std::istringstream iss(line);
+            iss >> numNodes >> numEdges >> fmt;
+        } catch (const std::exception& e) {
+            std::cerr << "Error parsing METIS header: " << e.what() << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        
+        // Read adjacency lists
+        node = 1; // Reset node counter
+        while (std::getline(graphStream, line)) {
+            if (line.empty() || line[0] == '#') {
+                continue;  // Skip empty lines and comments
+            }
+            
+            try {
+                std::istringstream lineStream(line);
+                NodeId neighbor;
+                
+                // Add edges for this node
+                while (lineStream >> neighbor) {
+                    // If this node or its neighbor is in my partition, add the edge
+                    if (myNodes.find(node) != myNodes.end() || myNodes.find(neighbor) != myNodes.end()) {
+                        graph.addEdge(node, neighbor);
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Error parsing METIS line " << node << ": " << e.what() << std::endl;
+                // Continue with the next line instead of aborting
+            }
+            
+            node++;
+            
+            // Safety check to ensure we don't exceed declared number of nodes
+            if (node > numNodes) {
+                break;
             }
         }
         
-        node++;
+        graphStream.close();
+        
+        // Get hostname for debugging
+        char hostname[256];
+        gethostname(hostname, sizeof(hostname));
+        
+        // Output some stats
+        std::cout << "Rank " << rank << " on host " << hostname 
+                  << " loaded " << graph.nodes.size() 
+                  << " nodes and " << graph.adjList.size() << " edges." << std::endl;
+                  
+    } catch (const std::exception& e) {
+        std::cerr << "Error in LoadPartitionedGraph: " << e.what() << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
     
     return graph;
