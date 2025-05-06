@@ -191,7 +191,7 @@ std::unordered_map<NodeId, double> MPIOnlyPR(const Graph& graph,
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
     if (rank == 0) {
-        std::cout << "Starting MPIOnlyPR computation with " << graph.nodes.size() << " nodes in rank " << rank << std::endl;
+        std::cout << "Starting influence power computation..." << std::endl;
     }
     
     // Initialize parameters
@@ -208,10 +208,6 @@ std::unordered_map<NodeId, double> MPIOnlyPR(const Graph& graph,
         compToNodes[compId].push_back(node);
     }
     
-    if (rank == 0) {
-        std::cout << "Built compToNodes mapping with " << compToNodes.size() << " components" << std::endl;
-    }
-    
     // Initialize influence power (PR values)
     std::unordered_map<NodeId, double> PR;
     for (NodeId node : graph.nodes) {
@@ -223,8 +219,8 @@ std::unordered_map<NodeId, double> MPIOnlyPR(const Graph& graph,
     const int maxIterations = 20;  // Reduced maximum iterations for large graphs
     
     while (diff > epsilon && iterations < maxIterations) {
-        if (rank == 0) {
-            std::cout << "Starting iteration " << iterations << " with diff = " << diff << std::endl;
+        if (rank == 0 && (iterations == 0 || iterations % 5 == 0)) {
+            std::cout << "Iteration " << iterations << " with diff = " << diff << std::endl;
         }
         
         double localDiff = 0.0;
@@ -232,10 +228,6 @@ std::unordered_map<NodeId, double> MPIOnlyPR(const Graph& graph,
         // Process each level in order
         for (size_t levelIdx = 0; levelIdx < levels.size(); levelIdx++) {
             const auto& level = levels[levelIdx];
-            
-            if (rank == 0 && iterations == 0) {
-                std::cout << "Processing level " << levelIdx << " with " << level.size() << " components" << std::endl;
-            }
             
             // Within each level, process components in this MPI rank
             for (CompId compId : level) {
@@ -292,7 +284,7 @@ std::unordered_map<NodeId, double> MPIOnlyPR(const Graph& graph,
         // Synchronize diff across all MPI processes
         MPI_Allreduce(&localDiff, &diff, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         
-        if (rank == 0) {
+        if (rank == 0 && (iterations == 0 || iterations % 5 == 0 || diff <= epsilon || iterations == maxIterations - 1)) {
             std::cout << "Iteration " << iterations << " complete. Global diff = " << diff << std::endl;
         }
         
@@ -300,7 +292,7 @@ std::unordered_map<NodeId, double> MPIOnlyPR(const Graph& graph,
     }
     
     if (rank == 0) {
-        std::cout << "MPIOnlyPR completed after " << iterations << " iterations" << std::endl;
+        std::cout << "Influence power computation completed after " << iterations << " iterations" << std::endl;
     }
     
     // Normalize final scores locally
@@ -493,16 +485,12 @@ Graph LoadPartitionedGraph(const std::string& metisFile, const std::string& part
         return graph;
     }
     
-    std::cout << "Rank " << rank << " reading partition file..." << std::endl;
-    
     // Read partition assignments (one per line)
     int partId;
     while (partStream >> partId) {
         nodePartitions.push_back(partId);
     }
     partStream.close();
-    
-    std::cout << "Rank " << rank << " read " << nodePartitions.size() << " partition assignments" << std::endl;
     
     // Open the graph file
     std::ifstream graphStream(metisFile);
@@ -522,7 +510,9 @@ Graph LoadPartitionedGraph(const std::string& metisFile, const std::string& part
     int numNodes, numEdges;
     iss >> numNodes >> numEdges;
     
-    std::cout << "Rank " << rank << " loading a graph with " << numNodes << " nodes and " << numEdges << " edges" << std::endl;
+    if (rank == 0) {
+        std::cout << "Loading graph with " << numNodes << " nodes and " << numEdges << " edges" << std::endl;
+    }
     
     // Check if we have enough partition info
     if (nodePartitions.size() < static_cast<size_t>(numNodes)) {
@@ -538,7 +528,9 @@ Graph LoadPartitionedGraph(const std::string& metisFile, const std::string& part
         }
     }
     
-    std::cout << "Rank " << rank << " is responsible for " << nodeCount << " nodes" << std::endl;
+    if (rank == 0) {
+        std::cout << "Distributing nodes across " << numProcs << " processes" << std::endl;
+    }
     
     // Reset file position to header
     graphStream.clear();
@@ -585,8 +577,9 @@ Graph LoadPartitionedGraph(const std::string& metisFile, const std::string& part
         }
     }
     
-    std::cout << "Rank " << rank << " loaded " << graph.nodes.size() << " nodes and " 
-              << graph.adjList.size() << " adjacency lists" << std::endl;
+    if (rank == 0) {
+        std::cout << "Graph loading complete" << std::endl;
+    }
     
     return graph;
 } 

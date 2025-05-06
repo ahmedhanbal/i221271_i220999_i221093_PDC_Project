@@ -84,7 +84,7 @@ void DiscoverIterative(NodeId startNode, const Graph& graph, std::unordered_map<
             NodeId v = neighbors[state.nextNeighbor];
             
             if (nodeInfo.find(v) == nodeInfo.end()) {
-                std::cerr << "Warning: Node " << v << " not found in nodeInfo map" << std::endl;
+                // Skip nodes not in nodeInfo map without output
                 continue;
             }
             
@@ -159,8 +159,9 @@ std::unordered_map<NodeId, CompId> GraphPartition(const Graph& graph) {
     for (NodeId node : graph.nodes) {
         if (nodeInfo[node].index == -1) {
             try {
-                if (visitedCount % 1000 == 0 || visitedCount < 10) {
-                    std::cout << "Processing component starting with node " << node << " (" << visitedCount << ")" << std::endl;
+                // Reduce output for large graphs
+                if (visitedCount % 10000 == 0) {
+                    std::cout << "Processing component " << visitedCount << "..." << std::endl;
                 }
                 
                 DiscoverIterative(node, graph, nodeInfo, stack, index, compId);
@@ -168,7 +169,7 @@ std::unordered_map<NodeId, CompId> GraphPartition(const Graph& graph) {
                 visitedCount++;
                 processedNodes++;
                 
-                if (processedNodes >= 10000) {
+                if (processedNodes >= 50000) {
                     std::cout << "  Processed " << visitedCount << " components..." << std::endl;
                     processedNodes = 0;
                 }
@@ -186,8 +187,6 @@ std::unordered_map<NodeId, CompId> GraphPartition(const Graph& graph) {
     for (const auto& [node, info] : nodeInfo) {
         partition[node] = info.compId;
     }
-    
-    std::cout << "Partition extraction complete." << std::endl;
     
     return partition;
 }
