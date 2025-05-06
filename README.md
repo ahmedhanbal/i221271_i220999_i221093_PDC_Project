@@ -35,6 +35,8 @@ The serial and MPI-only implementations follow the same algorithm logic but with
 - OpenMP support
 - METIS graph partitioning library
 - Python 3.6+
+- higgs-social_network.edgelist is in root of repo 
+  - download from [link](https://snap.stanford.edu/data/higgs-twitter.html)
 
 ### Installation on Ubuntu
 
@@ -172,3 +174,4 @@ All three implementations follow the same algorithmic approach, but with differe
 ## References
 
 - [PSAIIM research paper](PSAIIM_Paper.pdf)
+- [Dataset](https://snap.stanford.edu/data/higgs-twitter.html)
