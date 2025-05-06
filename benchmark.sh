@@ -14,6 +14,9 @@ LOCAL_DATA_DIR="./data"
 HOST_FILE="./hosts"
 OUTPUT_DIR="./benchmark_results"
 SKIP_PARTITIONING=false
+RUN_SERIAL=false     # Default: don't run serial version
+RUN_MPI_ONLY=false   # Default: don't run MPI-only version
+NUM_RUNS=3           # Default: run each configuration 3 times
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -46,6 +49,23 @@ while [[ $# -gt 0 ]]; do
       SKIP_PARTITIONING=true
       shift
       ;;
+    --serial)
+      RUN_SERIAL=true
+      shift
+      ;;
+    --mpi-only)
+      RUN_MPI_ONLY=true
+      shift
+      ;;
+    --all)
+      RUN_SERIAL=true
+      RUN_MPI_ONLY=true
+      shift
+      ;;
+    --runs)
+      NUM_RUNS="$2"
+      shift 2
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
@@ -57,6 +77,10 @@ while [[ $# -gt 0 ]]; do
       echo "  -m, --mirror DIR             Shared mirror directory (default: /mirror)"
       echo "  -o, --output DIR             Directory to store benchmark results (default: ./benchmark_results)"
       echo "  --skip-partitioning          Skip the METIS partitioning step (manual partitioning required)"
+      echo "  --serial                     Also run the serial version for comparison"
+      echo "  --mpi-only                   Also run the MPI-only version for comparison"
+      echo "  --all                        Run all implementations (serial, MPI-only, MPI+OpenMP)"
+      echo "  --runs NUM                   Number of runs for each configuration (default: 3)"
       echo "  -h, --help                   Show this help message"
       exit 0
       ;;
@@ -81,14 +105,21 @@ function check_dependency() {
 mkdir -p "$OUTPUT_DIR"
 
 # Create CSV file for benchmark results
-RESULTS_CSV="$OUTPUT_DIR/benchmark_results.csv"
-echo "Processes,ExecutionTime_ms,Timestamp" > "$RESULTS_CSV"
+RESULTS_CSV="$OUTPUT_DIR/benchmark_results_$(date +%Y%m%d_%H%M%S).csv"
+echo "Implementation,Processes,ExecutionTime_ms,Timestamp,RunNumber" > "$RESULTS_CSV"
 
 echo "=== PSAIIM Algorithm Benchmark ==="
 echo "Number of seeds (k): $K"
 echo "Process range: $MIN_PROCS to $MAX_PROCS (step: $STEP)"
+echo "Number of runs per configuration: $NUM_RUNS"
 echo "Host file: $HOST_FILE"
 echo "Output directory: $OUTPUT_DIR"
+if [ "$RUN_SERIAL" = true ]; then
+  echo "Serial version will be benchmarked"
+fi
+if [ "$RUN_MPI_ONLY" = true ]; then
+  echo "MPI-only version will be benchmarked"
+fi
 echo ""
 
 # Check for MPI
@@ -148,13 +179,92 @@ fi
 
 # Step 2: Compile the PSAIIM code
 echo "[2/3] Compiling PSAIIM code..."
-make
+make all
 
-# Step 3: Run benchmarks with different numbers of processes
-echo "[3/3] Running benchmarks with different process counts..."
+# Step 3: Run benchmarks with different configurations
+echo "[3/3] Running benchmarks..."
+
+# Run the serial version if requested
+if [ "$RUN_SERIAL" = true ]; then
+  echo ""
+  echo "==== Running serial version ===="
+  
+  for ((run=1; run<=NUM_RUNS; run++)); do
+    echo "Run $run/$NUM_RUNS..."
+    
+    # Create a timestamp
+    TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+    RESULT_FILE="$OUTPUT_DIR/result_serial_run${run}_${TIMESTAMP}.txt"
+    
+    # Run the PSAIIM algorithm (serial)
+    echo "Starting PSAIIM Serial..."
+    bin/psaiim_serial "$LOCAL_DATA_DIR/higgs.graph" "$K" | tee "$RESULT_FILE"
+    
+    # Extract execution time (assumes it's printed in the output)
+    EXEC_TIME=$(grep "execution time:" "$RESULT_FILE" | awk '{print $4}')
+    if [ -n "$EXEC_TIME" ]; then
+      echo "Serial,0,$EXEC_TIME,$TIMESTAMP,$run" >> "$RESULTS_CSV"
+      echo "Execution time for serial run $run: $EXEC_TIME ms"
+    else
+      echo "Couldn't extract execution time from output"
+    fi
+  done
+fi
+
+# Run the MPI-only version if requested
+if [ "$RUN_MPI_ONLY" = true ]; then
+  # Run the MPI-only version with different numbers of processes
+  for NUM_PROCS in $(seq $MIN_PROCS $STEP $MAX_PROCS); do
+    echo ""
+    echo "==== Running MPI-only version with $NUM_PROCS processes ===="
+    
+    # Create partition file if needed
+    if [ ! -f "$LOCAL_DATA_DIR/higgs.graph.part.$NUM_PROCS" ]; then
+      echo "Creating partition with $NUM_PROCS parts..."
+      
+      if [ "$SKIP_PARTITIONING" = true ]; then
+        echo "Partitioning is skipped. Missing partition file for $NUM_PROCS processes."
+        echo "Please create the file $LOCAL_DATA_DIR/higgs.graph.part.$NUM_PROCS manually."
+        continue  # Skip this process count
+      elif command -v gpmetis &> /dev/null; then
+        # Use METIS if available
+        gpmetis "$LOCAL_DATA_DIR/higgs.graph" "$NUM_PROCS"
+      else
+        # Use simple round-robin partitioning
+        create_simple_partition "$NUM_PROCS" "$LOCAL_DATA_DIR/higgs.graph" "$LOCAL_DATA_DIR/higgs.graph.part.$NUM_PROCS"
+      fi
+    else
+      echo "Partition file for $NUM_PROCS processes already exists."
+    fi
+    
+    # Run multiple times
+    for ((run=1; run<=NUM_RUNS; run++)); do
+      echo "Run $run/$NUM_RUNS with $NUM_PROCS processes..."
+      
+      # Create a timestamp
+      TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+      RESULT_FILE="$OUTPUT_DIR/result_mpi_only_${NUM_PROCS}_procs_run${run}_${TIMESTAMP}.txt"
+      
+      # Run the PSAIIM algorithm (MPI-only)
+      echo "Starting PSAIIM MPI-only with $NUM_PROCS processes..."
+      mpirun --hostfile "$HOST_FILE" -np "$NUM_PROCS" bin/psaiim_mpi_only "$LOCAL_DATA_DIR/higgs.graph" "$LOCAL_DATA_DIR/higgs.graph.part.$NUM_PROCS" "$K" | tee "$RESULT_FILE"
+      
+      # Extract execution time (assumes it's printed in the output)
+      EXEC_TIME=$(grep "execution time:" "$RESULT_FILE" | awk '{print $4}')
+      if [ -n "$EXEC_TIME" ]; then
+        echo "MPI-only,$NUM_PROCS,$EXEC_TIME,$TIMESTAMP,$run" >> "$RESULTS_CSV"
+        echo "Execution time with $NUM_PROCS processes run $run: $EXEC_TIME ms"
+      else
+        echo "Couldn't extract execution time from output"
+      fi
+    done
+  done
+fi
+
+# Run the MPI+OpenMP version (standard parallel version)
 for NUM_PROCS in $(seq $MIN_PROCS $STEP $MAX_PROCS); do
   echo ""
-  echo "==== Running with $NUM_PROCS processes ===="
+  echo "==== Running MPI+OpenMP version with $NUM_PROCS processes ===="
   
   # Create partition file if needed
   if [ ! -f "$LOCAL_DATA_DIR/higgs.graph.part.$NUM_PROCS" ]; then
@@ -175,22 +285,27 @@ for NUM_PROCS in $(seq $MIN_PROCS $STEP $MAX_PROCS); do
     echo "Partition file for $NUM_PROCS processes already exists."
   fi
   
-  # Create a timestamp
-  TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-  RESULT_FILE="$OUTPUT_DIR/result_${NUM_PROCS}_procs_${TIMESTAMP}.txt"
-  
-  # Run the PSAIIM algorithm
-  echo "Starting PSAIIM with $NUM_PROCS processes..."
-  mpirun --hostfile "$HOST_FILE" -np "$NUM_PROCS" bin/psaiim_rank "$LOCAL_DATA_DIR/higgs.graph" "$LOCAL_DATA_DIR/higgs.graph.part.$NUM_PROCS" "$K" | tee "$RESULT_FILE"
-  
-  # Extract execution time (assumes it's printed in the output)
-  EXEC_TIME=$(grep "execution time:" "$RESULT_FILE" | awk '{print $4}')
-  if [ -n "$EXEC_TIME" ]; then
-    echo "$NUM_PROCS,$EXEC_TIME,$TIMESTAMP" >> "$RESULTS_CSV"
-    echo "Execution time with $NUM_PROCS processes: $EXEC_TIME ms"
-  else
-    echo "Couldn't extract execution time from output"
-  fi
+  # Run multiple times
+  for ((run=1; run<=NUM_RUNS; run++)); do
+    echo "Run $run/$NUM_RUNS with $NUM_PROCS processes..."
+    
+    # Create a timestamp
+    TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+    RESULT_FILE="$OUTPUT_DIR/result_mpi_openmp_${NUM_PROCS}_procs_run${run}_${TIMESTAMP}.txt"
+    
+    # Run the PSAIIM algorithm (MPI+OpenMP)
+    echo "Starting PSAIIM MPI+OpenMP with $NUM_PROCS processes..."
+    mpirun --hostfile "$HOST_FILE" -np "$NUM_PROCS" bin/psaiim_rank "$LOCAL_DATA_DIR/higgs.graph" "$LOCAL_DATA_DIR/higgs.graph.part.$NUM_PROCS" "$K" | tee "$RESULT_FILE"
+    
+    # Extract execution time (assumes it's printed in the output)
+    EXEC_TIME=$(grep "execution time:" "$RESULT_FILE" | awk '{print $4}')
+    if [ -n "$EXEC_TIME" ]; then
+      echo "MPI+OpenMP,$NUM_PROCS,$EXEC_TIME,$TIMESTAMP,$run" >> "$RESULTS_CSV"
+      echo "Execution time with $NUM_PROCS processes run $run: $EXEC_TIME ms"
+    else
+      echo "Couldn't extract execution time from output"
+    fi
+  done
 done
 
 echo ""
@@ -198,11 +313,72 @@ echo "Benchmark completed. Results saved to $RESULTS_CSV"
 echo ""
 
 # Generate simple report if we have results
-if [ -s "$RESULTS_CSV" ] && [ "$(wc -l < "$RESULTS_CSV")" -gt 1 ]; then
-  echo "=== Benchmark Summary ==="
-  echo "Process count | Execution time (ms)"
-  echo "-----------------------------"
-  sort -t, -k2,2n "$RESULTS_CSV" | tail -n +2 | awk -F, '{printf "%-12s | %s ms\n", $1, $2}'
-else
-  echo "No benchmark results collected."
+echo "Generating summary..."
+if [ -f "$RESULTS_CSV" ]; then
+  echo "===================== BENCHMARK SUMMARY ====================="
+  echo "Configuration          | Avg Time (ms) | Speedup vs Serial"
+  echo "--------------------------------------------------------"
+  
+  # Calculate average for serial if it exists
+  SERIAL_AVG=0
+  if [ "$RUN_SERIAL" = true ]; then
+    SERIAL_TIMES=$(grep "^Serial," "$RESULTS_CSV" | cut -d',' -f3)
+    if [ -n "$SERIAL_TIMES" ]; then
+      SERIAL_SUM=0
+      SERIAL_COUNT=0
+      for time in $SERIAL_TIMES; do
+        SERIAL_SUM=$((SERIAL_SUM + time))
+        SERIAL_COUNT=$((SERIAL_COUNT + 1))
+      done
+      SERIAL_AVG=$((SERIAL_SUM / SERIAL_COUNT))
+      echo "Serial                | $SERIAL_AVG      | 1.00x"
+    fi
+  fi
+  
+  # Calculate averages for MPI-only version at different process counts
+  if [ "$RUN_MPI_ONLY" = true ]; then
+    for NUM_PROCS in $(seq $MIN_PROCS $STEP $MAX_PROCS); do
+      PROC_TIMES=$(grep "^MPI-only,$NUM_PROCS," "$RESULTS_CSV" | cut -d',' -f3)
+      if [ -n "$PROC_TIMES" ]; then
+        SUM=0
+        COUNT=0
+        for time in $PROC_TIMES; do
+          SUM=$((SUM + time))
+          COUNT=$((COUNT + 1))
+        done
+        AVG=$((SUM / COUNT))
+        
+        # Calculate speedup if serial was run
+        if [ "$RUN_SERIAL" = true ] && [ "$SERIAL_AVG" -gt 0 ]; then
+          SPEEDUP=$(echo "scale=2; $SERIAL_AVG / $AVG" | bc)
+          echo "MPI-only ($NUM_PROCS procs) | $AVG      | ${SPEEDUP}x"
+        else
+          echo "MPI-only ($NUM_PROCS procs) | $AVG      | N/A"
+        fi
+      fi
+    done
+  fi
+  
+  # Calculate averages for MPI+OpenMP version at different process counts
+  for NUM_PROCS in $(seq $MIN_PROCS $STEP $MAX_PROCS); do
+    PROC_TIMES=$(grep "^MPI+OpenMP,$NUM_PROCS," "$RESULTS_CSV" | cut -d',' -f3)
+    if [ -n "$PROC_TIMES" ]; then
+      SUM=0
+      COUNT=0
+      for time in $PROC_TIMES; do
+        SUM=$((SUM + time))
+        COUNT=$((COUNT + 1))
+      done
+      AVG=$((SUM / COUNT))
+      
+      # Calculate speedup if serial was run
+      if [ "$RUN_SERIAL" = true ] && [ "$SERIAL_AVG" -gt 0 ]; then
+        SPEEDUP=$(echo "scale=2; $SERIAL_AVG / $AVG" | bc)
+        echo "MPI+OpenMP ($NUM_PROCS procs) | $AVG      | ${SPEEDUP}x"
+      else
+        echo "MPI+OpenMP ($NUM_PROCS procs) | $AVG      | N/A"
+      fi
+    fi
+  done
+  echo "=========================================================="
 fi 
